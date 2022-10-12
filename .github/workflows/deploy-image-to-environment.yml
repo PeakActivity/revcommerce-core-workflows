@@ -1,0 +1,145 @@
+name: Deploy an image
+
+on: 
+  workflow_call:
+    inputs:
+      client:
+        description: |
+          The name of the client (customer) this deployment relates to
+        required: true
+        type: string
+      env:
+        default: dev
+        description: |
+          The environment to deploy to (eg prod, uat, dev)
+        required: true
+        type: string
+      image:
+        description: |
+          The fully qualified name of the docker image to deploy
+        required: true
+        type: string
+      project:
+        default: default-project
+        description: |
+          The name of the client's project. If the client only has one project then this will be
+          'default-project'
+        required: true
+        type: string
+      slack_webhook_url:
+        description: |
+          The webhook URL used to send Slack notifications
+        required: true
+        type: string
+
+
+jobs:
+  deploy-image-to-environment:
+    name: Deploy an image to an environment
+    runs-on: ubuntu-22.04
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+      
+    steps:
+
+      - name: Log input parameters
+        run: echo '${{ toJSON(inputs) }}'
+
+      - name: Send notification of deployment start
+        uses: slackapi/slack-github-action@v1.21.0
+        with:
+          payload: |
+            {
+              "text": "GitHub Action build result: ${{ job.status }}\n${{ github.event.pull_request.html_url || github.event.head_commit.url }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "GitHub Action build result: ${{ job.status }}\n${{ github.event.pull_request.html_url || github.event.head_commit.url }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ inputs.slack_webhook_url }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+      
+      - name: Check out the repository
+        uses: actions/checkout@v3
+      
+      - name: Setup npm
+        uses: actions/setup-node@v3
+        with:
+          node-version: 18.9.0
+
+      - name: Validate cloud-config.yml
+        run: npx pajv -s .deployment/cloud-config.schema.yml -d .deployment/${{ inputs.client }}/${{ inputs.project }}/${{ inputs.env }}/kubernetes/cloud-config.yml
+
+      - name: Lint check Kubernetes manifests 
+        uses: azure/k8s-lint@v1
+        with:
+          lintType: kubeval
+          manifests: |
+            .deployment/${{ inputs.client }}/${{ inputs.project }}/${{ inputs.env }}/kubernetes/deployment.yml
+            .deployment/${{ inputs.client }}/${{ inputs.project }}/${{ inputs.env }}/kubernetes/service.yml
+
+      - name: Load cloud provider configuration
+        id: cloud-config
+        uses: jbutcher5/read-yaml@1.6
+        with:
+          file: .deployment/${{ inputs.client }}/${{ inputs.project }}/${{ inputs.env }}/kubernetes/cloud-config.yml
+          key-path: '["provider"]' 
+
+      - name: Authenticate to Google Cloud
+        if: fromJSON(steps.cloud-config.outputs.data).gcp != 0
+        id: auth
+        uses: 'google-github-actions/auth@v0.4.0'
+        with:
+          token_format: 'access_token'
+          workload_identity_provider: ${{ fromJSON(steps.cloud-config.outputs.data).gcp.workload_identity_provider }}
+          service_account: ${{ fromJSON(steps.cloud-config.outputs.data).gcp.service_account }}
+      
+      - name: Login to GCR
+        if: fromJSON(steps.cloud-config.outputs.data).gcp != 0
+        uses: docker/login-action@v2
+        with:
+          registry: gcr.io
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Configure kubernetes cluster credentials
+        if: fromJSON(steps.cloud-config.outputs.data).gcp != 0
+        id: get-credentials
+        uses: 'google-github-actions/get-gke-credentials@v0.8.0'
+        with:
+          cluster_name: ${{ fromJSON(steps.cloud-config.outputs.data).gcp.cluster_name }}
+          location: ${{ fromJSON(steps.cloud-config.outputs.data).gcp.location }}
+
+      - name: Try a dry-run deployment 
+        uses: azure/k8s-lint@v2.0
+        with:
+          lintType: dryrun
+          manifests: |
+            .deployment/${{ inputs.client }}/${{ inputs.project }}/${{ inputs.env }}/kubernetes/deployment.yml
+            .deployment/${{ inputs.client }}/${{ inputs.project }}/${{ inputs.env }}/kubernetes/service.yml
+          namespace: ${{ inputs.client }}
+
+      - name: Deploy
+        uses: Azure/k8s-deploy@v4.4
+        with:
+          action: deploy
+          images: ${{ inputs.image }}
+          manifests:  |
+            .deployment/${{ inputs.client }}/${{ inputs.project }}/${{ inputs.env }}/kubernetes/deployment.yml
+            .deployment/${{ inputs.client }}/${{ inputs.project }}/${{ inputs.env }}/kubernetes/service.yml
+          namespace: ${{ inputs.client }}
+          strategy: basic
+          token: ${{ github.token }}
+
+
+
+
+    
