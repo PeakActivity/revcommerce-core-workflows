@@ -37,7 +37,7 @@ jobs:
   deploy-image-to-environment:
     name: Deploy an image to an environment
     runs-on: ubuntu-22.04
-    # environment: ${{ inputs.env }}
+    environment: ${{ inputs.env }}
     permissions:
       id-token: write
       contents: read
